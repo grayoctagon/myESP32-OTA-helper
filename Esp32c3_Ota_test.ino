@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <Update.h>
 #include <SPIFFS.h>
 #include "esp_ota_ops.h"
@@ -16,11 +14,6 @@ const char *WIFI_PASSWORD = "DEIN_PASSWORT";
 // Optional: Wenn du start_polling ohne URL nutzt, trage hier deine Update URL ein.
 // Ohne Schema wird automatisch http:// davor gesetzt.
 const char *DEFAULT_UPDATE_URL = ""; // z.B. "example.com/firmware/esp32c3.bin"
-
-// Fuer HTTPS in Produktion bitte ein Root CA Zertifikat setzen.
-// Wenn OTA_HTTPS_ROOT_CA leer bleibt, nutzt der Sketch setInsecure(). Das funktioniert,
-// prueft aber das Serverzertifikat nicht.
-const char *OTA_HTTPS_ROOT_CA = nullptr;
 
 const uint32_t SERIAL_BAUD = 115200;
 const uint32_t HTTP_TIMEOUT_MS = 15000;
@@ -41,6 +34,13 @@ bool otaPollDeleteFlash = false;
 bool otaPollVerbose = true;
 uint32_t otaPollIntervalSeconds = 0;
 uint32_t otaLastPollMs = 0;
+
+struct ParsedHttpUrl {
+  String host;
+  String path;
+  uint16_t port = 80;
+  bool ok = false;
+};
 
 // =========================
 // Kleine Hilfsfunktionen
@@ -126,7 +126,7 @@ String espMacHyphen() {
   return mac;
 }
 
-String normalizeUrl(String url) {
+String normalizeHttpUrl(String url) {
   url.trim();
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     url = "http://" + url;
@@ -135,6 +135,11 @@ String normalizeUrl(String url) {
 }
 
 String addUpdateQueryParams(String url) {
+  int hash = url.indexOf('#');
+  if (hash >= 0) {
+    url = url.substring(0, hash);
+  }
+
   String sep;
   if (url.indexOf('?') < 0) {
     sep = "?";
@@ -150,6 +155,119 @@ String addUpdateQueryParams(String url) {
   url += "&currentFirmware=";
   url += urlEncode(currentFirmwareVersion());
   return url;
+}
+
+ParsedHttpUrl parseHttpUrl(String url, String &error) {
+  ParsedHttpUrl parsed;
+  url = normalizeHttpUrl(url);
+
+  if (url.startsWith("https://")) {
+    error = "HTTPS ist in diesem Minimal-Build deaktiviert. Bitte http:// verwenden.";
+    return parsed;
+  }
+
+  if (!url.startsWith("http://")) {
+    error = "URL muss mit http:// beginnen oder ohne Schema angegeben werden.";
+    return parsed;
+  }
+
+  String rest = url.substring(7);
+  int slash = rest.indexOf('/');
+  String authority;
+
+  if (slash >= 0) {
+    authority = rest.substring(0, slash);
+    parsed.path = rest.substring(slash);
+  } else {
+    authority = rest;
+    parsed.path = "/";
+  }
+
+  int at = authority.lastIndexOf('@');
+  if (at >= 0) {
+    authority = authority.substring(at + 1);
+  }
+
+  if (authority.length() == 0) {
+    error = "Host fehlt in der URL.";
+    return parsed;
+  }
+
+  if (authority[0] == '[') {
+    int endBracket = authority.indexOf(']');
+    if (endBracket < 0) {
+      error = "Ungueltige IPv6 Host Schreibweise.";
+      return parsed;
+    }
+    parsed.host = authority.substring(1, endBracket);
+    if (authority.length() > (size_t)(endBracket + 1) && authority[endBracket + 1] == ':') {
+      parsed.port = (uint16_t)authority.substring(endBracket + 2).toInt();
+    }
+  } else {
+    int colon = authority.lastIndexOf(':');
+    if (colon >= 0) {
+      parsed.host = authority.substring(0, colon);
+      parsed.port = (uint16_t)authority.substring(colon + 1).toInt();
+    } else {
+      parsed.host = authority;
+      parsed.port = 80;
+    }
+  }
+
+  parsed.host.trim();
+  if (parsed.host.length() == 0) {
+    error = "Host fehlt in der URL.";
+    return parsed;
+  }
+  if (parsed.port == 0) {
+    error = "Port ist ungueltig.";
+    return parsed;
+  }
+  if (parsed.path.length() == 0) {
+    parsed.path = "/";
+  }
+
+  parsed.ok = true;
+  return parsed;
+}
+
+String readHttpLine(WiFiClient &client, uint32_t timeoutMs, bool &timedOut) {
+  String line;
+  uint32_t start = millis();
+  timedOut = false;
+
+  while (millis() - start < timeoutMs) {
+    while (client.available()) {
+      char c = (char)client.read();
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        return line;
+      }
+      line += c;
+      if (line.length() > 1024) {
+        return line;
+      }
+    }
+    if (!client.connected()) {
+      return line;
+    }
+    delay(1);
+  }
+
+  timedOut = true;
+  return line;
+}
+
+bool isOctetStream(String contentType) {
+  contentType.toLowerCase();
+  int semicolon = contentType.indexOf(';');
+  if (semicolon >= 0) {
+    contentType = contentType.substring(0, semicolon);
+  }
+  contentType.trim();
+  return contentType == "application/octet-stream";
 }
 
 void printVersion() {
@@ -189,24 +307,24 @@ void printEta(uint32_t seconds) {
   }
 }
 
-void otaFail(HTTPClient *http, const String &msg, bool verbose) {
+void otaFail(WiFiClient *client, const String &msg, bool verbose) {
   if (verbose) {
     Serial.print("OTA Fehler: ");
     Serial.println(msg);
   }
   Update.abort();
-  if (http) {
-    http->end();
+  if (client) {
+    client->stop();
   }
 }
 
 // =========================
-// OTA Kernfunktion
+// HTTP-only OTA Kernfunktion
 // =========================
 bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool verbose = true) {
-  url = normalizeUrl(url);
+  url = normalizeHttpUrl(url);
 
-  if (url == "http://" || url == "https://" || url.length() < 10) {
+  if (url == "http://" || url.length() < 10) {
     if (verbose) {
       Serial.println("OTA Fehler: Keine Update URL angegeben.");
     }
@@ -221,65 +339,100 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   }
 
   String fullUrl = addUpdateQueryParams(url);
-  bool https = fullUrl.startsWith("https://");
-
-  WiFiClient plainClient;
-  WiFiClientSecure secureClient;
-  HTTPClient http;
-
-  if (https) {
-    if (OTA_HTTPS_ROOT_CA && strlen(OTA_HTTPS_ROOT_CA) > 0) {
-      secureClient.setCACert(OTA_HTTPS_ROOT_CA);
-    } else {
-      secureClient.setInsecure();
-      if (verbose) {
-        Serial.println("Hinweis: HTTPS wird ohne Zertifikatspruefung genutzt.");
-      }
+  String parseError;
+  ParsedHttpUrl parsed = parseHttpUrl(fullUrl, parseError);
+  if (!parsed.ok) {
+    if (verbose) {
+      Serial.print("OTA Fehler: ");
+      Serial.println(parseError);
     }
+    return false;
   }
+
+  WiFiClient client;
+  client.setTimeout(HTTP_TIMEOUT_MS);
 
   if (verbose) {
     Serial.print("OTA URL: ");
     Serial.println(fullUrl);
+    Serial.print("Verbinde mit ");
+    Serial.print(parsed.host);
+    Serial.print(":");
+    Serial.println(parsed.port);
   }
 
-  bool beginOk = https ? http.begin(secureClient, fullUrl) : http.begin(plainClient, fullUrl);
-  if (!beginOk) {
-    if (verbose) {
-      Serial.println("OTA Fehler: HTTPClient.begin fehlgeschlagen.");
+  if (!client.connect(parsed.host.c_str(), parsed.port)) {
+    otaFail(&client, "TCP Verbindung fehlgeschlagen.", verbose);
+    return false;
+  }
+
+  client.print(String("GET ") + parsed.path + " HTTP/1.1\r\n");
+  client.print(String("Host: ") + parsed.host + "\r\n");
+  client.print("User-Agent: ESP32C3-OTA/1.0\r\n");
+  client.print("Accept: application/octet-stream\r\n");
+  client.print("Cache-Control: no-cache\r\n");
+  client.print("Connection: close\r\n");
+  client.print("\r\n");
+
+  bool timedOut = false;
+  String statusLine = readHttpLine(client, HTTP_TIMEOUT_MS, timedOut);
+  if (timedOut || statusLine.length() == 0) {
+    otaFail(&client, "Keine HTTP Statuszeile erhalten.", verbose);
+    return false;
+  }
+
+  int firstSpace = statusLine.indexOf(' ');
+  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+  int httpCode = 0;
+  if (firstSpace >= 0) {
+    String codeText = secondSpace > firstSpace ? statusLine.substring(firstSpace + 1, secondSpace) : statusLine.substring(firstSpace + 1);
+    httpCode = codeText.toInt();
+  }
+
+  if (httpCode != 200) {
+    otaFail(&client, "HTTP Status ist nicht 200. Statuszeile: " + statusLine, verbose);
+    return false;
+  }
+
+  String contentType;
+  int contentLength = -1;
+
+  while (true) {
+    String line = readHttpLine(client, HTTP_TIMEOUT_MS, timedOut);
+    if (timedOut) {
+      otaFail(&client, "Timeout beim Lesen der HTTP Header.", verbose);
+      return false;
     }
+
+    if (line.length() == 0) {
+      break;
+    }
+
+    int colon = line.indexOf(':');
+    if (colon <= 0) {
+      continue;
+    }
+
+    String name = line.substring(0, colon);
+    String value = line.substring(colon + 1);
+    name.trim();
+    value.trim();
+    name.toLowerCase();
+
+    if (name == "content-type") {
+      contentType = value;
+    } else if (name == "content-length") {
+      contentLength = value.toInt();
+    }
+  }
+
+  if (!isOctetStream(contentType)) {
+    otaFail(&client, "Content-Type ist nicht application/octet-stream, sondern '" + contentType + "'", verbose);
     return false;
   }
 
-  const char *headerKeys[] = {"Content-Type", "Content-Length"};
-  http.collectHeaders(headerKeys, 2);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("Cache-Control", "no-cache");
-  http.setUserAgent("ESP32C3-OTA/1.0");
-
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    otaFail(&http, "HTTP Status ist nicht 200, sondern " + String(httpCode) + " (" + http.errorToString(httpCode) + ")", verbose);
-    return false;
-  }
-
-  String contentType = http.header("Content-Type");
-  contentType.toLowerCase();
-  int semicolon = contentType.indexOf(';');
-  if (semicolon >= 0) {
-    contentType = contentType.substring(0, semicolon);
-  }
-  contentType.trim();
-
-  if (contentType != "application/octet-stream") {
-    otaFail(&http, "Content-Type ist nicht application/octet-stream, sondern '" + contentType + "'", verbose);
-    return false;
-  }
-
-  int contentLength = http.getSize();
   if (contentLength <= 0) {
-    otaFail(&http, "Content-Length fehlt oder ist ungueltig.", verbose);
+    otaFail(&client, "Content-Length fehlt oder ist ungueltig.", verbose);
     return false;
   }
 
@@ -294,11 +447,15 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
     msg += " KB, verfuegbarer OTA App Speicher: ";
     msg += String(maxAllowed / 1024);
     msg += " KB";
-    otaFail(&http, msg, verbose);
+    otaFail(&client, msg, verbose);
     return false;
   }
 
   if (verbose) {
+    Serial.print("HTTP Status: ");
+    Serial.println(httpCode);
+    Serial.print("Content-Type: ");
+    Serial.println(contentType);
     Serial.print("Firmware Groesse: ");
     Serial.print(contentLength / 1024);
     Serial.println(" KB");
@@ -312,46 +469,61 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   }
 
   if (!Update.begin((size_t)contentLength, U_FLASH)) {
-    otaFail(&http, "Update.begin fehlgeschlagen: " + String(Update.errorString()), verbose);
+    otaFail(&client, "Update.begin fehlgeschlagen: " + String(Update.errorString()), verbose);
     return false;
   }
 
-  WiFiClient *stream = http.getStreamPtr();
   uint8_t buffer[OTA_BUFFER_SIZE];
   size_t written = 0;
   size_t lastWritten = 0;
   uint32_t startMs = millis();
   uint32_t lastReportMs = startMs;
+  uint32_t lastDataMs = startMs;
 
   if (verbose) {
     Serial.println("Download startet...");
   }
 
-  while (http.connected() && written < (size_t)contentLength) {
-    size_t available = stream->available();
-    if (available) {
-      size_t toRead = available;
-      if (toRead > OTA_BUFFER_SIZE) {
-        toRead = OTA_BUFFER_SIZE;
-      }
-      if (toRead > (size_t)contentLength - written) {
-        toRead = (size_t)contentLength - written;
-      }
+  while (written < (size_t)contentLength) {
+    int available = client.available();
 
-      int readBytes = stream->readBytes(buffer, toRead);
-      if (readBytes <= 0) {
-        otaFail(&http, "Stream readBytes lieferte 0 Bytes.", verbose);
+    if (available <= 0) {
+      if (!client.connected()) {
+        otaFail(&client, "Verbindung wurde vorzeitig geschlossen.", verbose);
         return false;
       }
-
-      size_t updateWritten = Update.write(buffer, (size_t)readBytes);
-      if (updateWritten != (size_t)readBytes) {
-        otaFail(&http, "Update.write fehlgeschlagen: " + String(Update.errorString()), verbose);
+      if (millis() - lastDataMs > HTTP_TIMEOUT_MS) {
+        otaFail(&client, "Timeout beim Firmware Download.", verbose);
         return false;
       }
-
-      written += updateWritten;
+      delay(1);
+      continue;
     }
+
+    size_t remaining = (size_t)contentLength - written;
+    size_t toRead = available;
+    if (toRead > OTA_BUFFER_SIZE) {
+      toRead = OTA_BUFFER_SIZE;
+    }
+    if (toRead > remaining) {
+      toRead = remaining;
+    }
+
+    int readBytes = client.readBytes(buffer, toRead);
+    if (readBytes <= 0) {
+      otaFail(&client, "Socket readBytes lieferte 0 Bytes.", verbose);
+      return false;
+    }
+
+    lastDataMs = millis();
+
+    size_t updateWritten = Update.write(buffer, (size_t)readBytes);
+    if (updateWritten != (size_t)readBytes) {
+      otaFail(&client, "Update.write fehlgeschlagen: " + String(Update.errorString()), verbose);
+      return false;
+    }
+
+    written += updateWritten;
 
     uint32_t now = millis();
     if (verbose && (now - lastReportMs >= 1000 || written == (size_t)contentLength)) {
@@ -385,21 +557,21 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   }
 
   if (written != (size_t)contentLength) {
-    otaFail(&http, "Download unvollstaendig: " + String(written) + " von " + String(contentLength) + " Bytes.", verbose);
+    otaFail(&client, "Download unvollstaendig: " + String(written) + " von " + String(contentLength) + " Bytes.", verbose);
     return false;
   }
 
   if (!Update.end(true)) {
-    otaFail(&http, "Update.end fehlgeschlagen: " + String(Update.errorString()), verbose);
+    otaFail(&client, "Update.end fehlgeschlagen: " + String(Update.errorString()), verbose);
     return false;
   }
 
   if (!Update.isFinished()) {
-    otaFail(&http, "Update ist nicht vollstaendig.", verbose);
+    otaFail(&client, "Update ist nicht vollstaendig.", verbose);
     return false;
   }
 
-  http.end();
+  client.stop();
 
   if (deleteFlash) {
     if (verbose) {
@@ -438,7 +610,7 @@ void start_polling(uint32_t seconds, String url = DEFAULT_UPDATE_URL, bool delet
     return;
   }
 
-  otaPollUrl = normalizeUrl(url);
+  otaPollUrl = normalizeHttpUrl(url);
   otaPollIntervalSeconds = seconds;
   otaPollDeleteFlash = deleteFlash;
   otaPollVerbose = verbose;
