@@ -29,6 +29,11 @@ Licensed under CC-BY-SA-4.0: you can use, share, and adapt them with proper attr
 * Optionales Polling nach neuer Firmware
 * Optionales Löschen der SPIFFS Partition über `esp_partition_erase_range()`
 
+
+## ToDos
+- Tippfehler "macadress" korrigieren
+- eine bessere Authentifikation des ESP32, statt nur die MAC adresse. Etwa Authorization: Bearer <device-token> -> im Flash des esp speichern, ggf automatisch rotieren?
+
 ## Serielle Befehle
 
 ```text
@@ -50,6 +55,8 @@ URLs ohne Schema werden automatisch als HTTP URL behandelt.
 
 ## Server Anforderungen
 
+Prompt für Serverseite: [backendPrompt.txt](./backendPrompt.txt)
+
 Der Firmware Server muss direkt eine `.bin` Datei ausliefern und folgende Header setzen:
 
 ```text
@@ -65,6 +72,8 @@ Beim Aufruf ergänzt der ESP32-C3 automatisch:
 ```
 
 Der Gedanke hierbei ist Aufwärtskompatibilität, damit der Server später erkennen kann welcher ESP32 nach Software fragt und diese spezifisch zurück gibt. Damit es z.B. einen ESP gibt der immer die bewaesserung.ino.bin Software bekommt und ein anderer die Lampe.ino.bin
+
+---
 
 ## Sicherheitshinweis
 
