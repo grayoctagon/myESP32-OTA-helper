@@ -2,8 +2,8 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <Update.h>
-#include <SPIFFS.h>
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 // =========================
 // WLAN einstellen
@@ -12,12 +12,18 @@ const char *WIFI_SSID = "DEIN_WLAN";
 const char *WIFI_PASSWORD = "DEIN_PASSWORT";
 
 // Optional: Wenn du start_polling ohne URL nutzt, trage hier deine Update URL ein.
-// Ohne Schema wird automatisch http:// davor gesetzt.
+// Ohne Schema wird automatisch http:// verwendet.
 const char *DEFAULT_UPDATE_URL = ""; // z.B. "example.com/firmware/esp32c3.bin"
 
 const uint32_t SERIAL_BAUD = 115200;
 const uint32_t HTTP_TIMEOUT_MS = 15000;
 const size_t OTA_BUFFER_SIZE = 4096;
+
+const size_t HOST_MAX = 96;
+const size_t PATH_MAX_LEN = 512;
+const size_t REQUEST_TARGET_MAX = 768;
+const size_t FW_VERSION_MAX = 192;
+const size_t SERIAL_LINE_MAX = 512;
 
 #if defined(__FILE_NAME__)
   #define OTA_SOURCE_FILE __FILE_NAME__
@@ -25,22 +31,21 @@ const size_t OTA_BUFFER_SIZE = 4096;
   #define OTA_SOURCE_FILE __FILE__
 #endif
 
+struct ParsedHttpUrl {
+  char host[HOST_MAX];
+  char path[PATH_MAX_LEN];
+  uint16_t port;
+};
+
 // =========================
 // Polling Status
 // =========================
-String otaPollUrl = DEFAULT_UPDATE_URL;
+char otaPollUrl[REQUEST_TARGET_MAX] = "";
 bool otaPollingEnabled = false;
 bool otaPollDeleteFlash = false;
 bool otaPollVerbose = true;
 uint32_t otaPollIntervalSeconds = 0;
 uint32_t otaLastPollMs = 0;
-
-struct ParsedHttpUrl {
-  String host;
-  String path;
-  uint16_t port = 80;
-  bool ok = false;
-};
 
 // =========================
 // Kleine Hilfsfunktionen
@@ -55,230 +60,265 @@ const char *baseName(const char *path) {
   return name;
 }
 
-String urlSafeText(const String &input) {
-  String out;
-  out.reserve(input.length() + 8);
+bool startsWithLiteral(const char *text, const char *prefix) {
+  while (*prefix) {
+    if (*text++ != *prefix++) return false;
+  }
+  return true;
+}
 
-  for (size_t i = 0; i < input.length(); i++) {
-    char c = input[i];
+char *trimInPlace(char *s) {
+  while (*s == ' ' || *s == '\t') s++;
+  char *end = s + strlen(s);
+  while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
+    *--end = '\0';
+  }
+  return s;
+}
+
+bool equalsIgnoreCase(const char *a, const char *b) {
+  while (*a && *b) {
+    char ca = *a++;
+    char cb = *b++;
+    if (ca >= 'A' && ca <= 'Z') ca += 32;
+    if (cb >= 'A' && cb <= 'Z') cb += 32;
+    if (ca != cb) return false;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+bool tokenEqualsIgnoreCase(const char *token, size_t tokenLen, const char *expected) {
+  for (size_t i = 0; i < tokenLen; i++) {
+    if (expected[i] == '\0') return false;
+    char ca = token[i];
+    char cb = expected[i];
+    if (ca >= 'A' && ca <= 'Z') ca += 32;
+    if (cb >= 'A' && cb <= 'Z') cb += 32;
+    if (ca != cb) return false;
+  }
+  return expected[tokenLen] == '\0';
+}
+
+void copySafe(char *dst, size_t dstLen, const char *src) {
+  if (!dst || dstLen == 0) return;
+  if (!src) src = "";
+  strncpy(dst, src, dstLen - 1);
+  dst[dstLen - 1] = '\0';
+}
+
+void makeUrlSafeDash(const char *in, char *out, size_t outLen) {
+  if (!out || outLen == 0) return;
+  size_t pos = 0;
+  bool lastDash = false;
+
+  for (size_t i = 0; in && in[i] && pos + 1 < outLen; i++) {
+    char c = in[i];
     bool safe = (c >= 'A' && c <= 'Z') ||
                 (c >= 'a' && c <= 'z') ||
                 (c >= '0' && c <= '9') ||
-                c == '-' || c == '_' || c == '.' || c == '~';
+                c == '_' || c == '.' || c == '~';
 
     if (safe) {
-      out += c;
-    } else if (c == ' ' || c == ':' || c == '/' || c == '\\') {
-      out += '-';
+      out[pos++] = c;
+      lastDash = false;
+    } else if (c == '-' || c == ' ' || c == ':' || c == '/' || c == '\\') {
+      if (!lastDash && pos > 0) {
+        out[pos++] = '-';
+        lastDash = true;
+      }
     } else {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%%%02X", (uint8_t)c);
-      out += buf;
+      if (!lastDash && pos > 0) {
+        out[pos++] = '-';
+        lastDash = true;
+      }
     }
   }
 
-  while (out.indexOf("--") >= 0) {
-    out.replace("--", "-");
-  }
-  return out;
+  if (pos > 0 && out[pos - 1] == '-') pos--;
+  out[pos] = '\0';
 }
 
-String urlEncode(const String &input) {
-  String out;
-  out.reserve(input.length() + 8);
+void getCurrentFirmwareVersion(char *out, size_t outLen) {
+  char raw[FW_VERSION_MAX];
+  snprintf(raw, sizeof(raw), "%s_%s_%s", __DATE__, __TIME__, baseName(OTA_SOURCE_FILE));
+  makeUrlSafeDash(raw, out, outLen);
+}
 
-  for (size_t i = 0; i < input.length(); i++) {
-    uint8_t c = (uint8_t)input[i];
-    bool safe = (c >= 'A' && c <= 'Z') ||
-                (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9') ||
-                c == '-' || c == '_' || c == '.' || c == '~';
+void getMacHyphen(char *out, size_t outLen) {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(out, outLen, "%02X-%02X-%02X-%02X-%02X-%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
-    if (safe) {
-      out += (char)c;
-    } else {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%%%02X", c);
-      out += buf;
+bool parseHttpUrl(const char *url, ParsedHttpUrl &parsed, char *error, size_t errorLen) {
+  memset(&parsed, 0, sizeof(parsed));
+  parsed.port = 80;
+
+  if (!url || !*url) {
+    copySafe(error, errorLen, "Keine URL angegeben.");
+    return false;
+  }
+
+  while (*url == ' ' || *url == '\t') url++;
+
+  if (startsWithLiteral(url, "https://")) {
+    copySafe(error, errorLen, "HTTPS ist in diesem Minimal-Build deaktiviert. Bitte http:// verwenden.");
+    return false;
+  }
+
+  if (startsWithLiteral(url, "http://")) {
+    url += 7;
+  }
+
+  if (!*url) {
+    copySafe(error, errorLen, "Host fehlt in der URL.");
+    return false;
+  }
+
+  const char *hostStart = url;
+  const char *p = hostStart;
+  while (*p && *p != '/' && *p != '?' && *p != '#') p++;
+
+  const char *hostEnd = p;
+  const char *colon = nullptr;
+  for (const char *h = hostStart; h < hostEnd; h++) {
+    if (*h == ':') colon = h;
+  }
+
+  size_t hostLen = colon ? (size_t)(colon - hostStart) : (size_t)(hostEnd - hostStart);
+  if (hostLen == 0 || hostLen >= HOST_MAX) {
+    copySafe(error, errorLen, "Host fehlt oder ist zu lang.");
+    return false;
+  }
+
+  memcpy(parsed.host, hostStart, hostLen);
+  parsed.host[hostLen] = '\0';
+
+  if (colon) {
+    uint32_t port = 0;
+    for (const char *d = colon + 1; d < hostEnd; d++) {
+      if (*d < '0' || *d > '9') {
+        copySafe(error, errorLen, "Port ist ungueltig.");
+        return false;
+      }
+      port = port * 10 + (uint32_t)(*d - '0');
+      if (port > 65535) {
+        copySafe(error, errorLen, "Port ist zu gross.");
+        return false;
+      }
     }
-  }
-  return out;
-}
-
-String currentFirmwareVersion() {
-  String date = __DATE__;   // z.B. "May 24 2026"
-  String time = __TIME__;   // z.B. "14:37:12"
-  String file = baseName(OTA_SOURCE_FILE);
-
-  date.trim();
-  while (date.indexOf("  ") >= 0) {
-    date.replace("  ", " ");
-  }
-  date.replace(" ", "-");
-  time.replace(":", "-");
-
-  return urlSafeText(date + "_" + time + "_" + file);
-}
-
-String espMacHyphen() {
-  String mac = WiFi.macAddress();
-  mac.replace(":", "-");
-  return mac;
-}
-
-String normalizeHttpUrl(String url) {
-  url.trim();
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    url = "http://" + url;
-  }
-  return url;
-}
-
-String addUpdateQueryParams(String url) {
-  int hash = url.indexOf('#');
-  if (hash >= 0) {
-    url = url.substring(0, hash);
+    if (port == 0) {
+      copySafe(error, errorLen, "Port ist ungueltig.");
+      return false;
+    }
+    parsed.port = (uint16_t)port;
   }
 
-  String sep;
-  if (url.indexOf('?') < 0) {
-    sep = "?";
-  } else if (url.endsWith("?") || url.endsWith("&")) {
-    sep = "";
+  if (*p == '/') {
+    const char *pathStart = p;
+    while (*p && *p != '#') p++;
+    size_t pathLen = (size_t)(p - pathStart);
+    if (pathLen == 0 || pathLen >= PATH_MAX_LEN) {
+      copySafe(error, errorLen, "Pfad ist zu lang.");
+      return false;
+    }
+    memcpy(parsed.path, pathStart, pathLen);
+    parsed.path[pathLen] = '\0';
+  } else if (*p == '?') {
+    if (strlen(p) + 2 >= PATH_MAX_LEN) {
+      copySafe(error, errorLen, "Query ist zu lang.");
+      return false;
+    }
+    parsed.path[0] = '/';
+    size_t i = 1;
+    while (*p && *p != '#' && i + 1 < PATH_MAX_LEN) {
+      parsed.path[i++] = *p++;
+    }
+    parsed.path[i] = '\0';
   } else {
-    sep = "&";
+    copySafe(parsed.path, sizeof(parsed.path), "/");
   }
 
-  url += sep;
-  url += "macadress="; // Schreibweise absichtlich wie angefordert
-  url += urlEncode(espMacHyphen());
-  url += "&currentFirmware=";
-  url += urlEncode(currentFirmwareVersion());
-  return url;
+  return true;
 }
 
-ParsedHttpUrl parseHttpUrl(String url, String &error) {
-  ParsedHttpUrl parsed;
-  url = normalizeHttpUrl(url);
+bool buildRequestTarget(const ParsedHttpUrl &parsed, char *target, size_t targetLen) {
+  char mac[24];
+  char fw[FW_VERSION_MAX];
+  getMacHyphen(mac, sizeof(mac));
+  getCurrentFirmwareVersion(fw, sizeof(fw));
 
-  if (url.startsWith("https://")) {
-    error = "HTTPS ist in diesem Minimal-Build deaktiviert. Bitte http:// verwenden.";
-    return parsed;
+  char sep = '?';
+  size_t pathLen = strlen(parsed.path);
+  if (strchr(parsed.path, '?')) {
+    sep = (pathLen > 0 && (parsed.path[pathLen - 1] == '?' || parsed.path[pathLen - 1] == '&')) ? '\0' : '&';
   }
 
-  if (!url.startsWith("http://")) {
-    error = "URL muss mit http:// beginnen oder ohne Schema angegeben werden.";
-    return parsed;
-  }
-
-  String rest = url.substring(7);
-  int slash = rest.indexOf('/');
-  String authority;
-
-  if (slash >= 0) {
-    authority = rest.substring(0, slash);
-    parsed.path = rest.substring(slash);
+  int n;
+  if (sep == '\0') {
+    n = snprintf(target, targetLen, "%smacadress=%s&currentFirmware=%s", parsed.path, mac, fw);
   } else {
-    authority = rest;
-    parsed.path = "/";
+    n = snprintf(target, targetLen, "%s%cmacadress=%s&currentFirmware=%s", parsed.path, sep, mac, fw);
   }
 
-  int at = authority.lastIndexOf('@');
-  if (at >= 0) {
-    authority = authority.substring(at + 1);
-  }
-
-  if (authority.length() == 0) {
-    error = "Host fehlt in der URL.";
-    return parsed;
-  }
-
-  if (authority[0] == '[') {
-    int endBracket = authority.indexOf(']');
-    if (endBracket < 0) {
-      error = "Ungueltige IPv6 Host Schreibweise.";
-      return parsed;
-    }
-    parsed.host = authority.substring(1, endBracket);
-    if (authority.length() > (size_t)(endBracket + 1) && authority[endBracket + 1] == ':') {
-      parsed.port = (uint16_t)authority.substring(endBracket + 2).toInt();
-    }
-  } else {
-    int colon = authority.lastIndexOf(':');
-    if (colon >= 0) {
-      parsed.host = authority.substring(0, colon);
-      parsed.port = (uint16_t)authority.substring(colon + 1).toInt();
-    } else {
-      parsed.host = authority;
-      parsed.port = 80;
-    }
-  }
-
-  parsed.host.trim();
-  if (parsed.host.length() == 0) {
-    error = "Host fehlt in der URL.";
-    return parsed;
-  }
-  if (parsed.port == 0) {
-    error = "Port ist ungueltig.";
-    return parsed;
-  }
-  if (parsed.path.length() == 0) {
-    parsed.path = "/";
-  }
-
-  parsed.ok = true;
-  return parsed;
+  return n > 0 && (size_t)n < targetLen;
 }
 
-String readHttpLine(WiFiClient &client, uint32_t timeoutMs, bool &timedOut) {
-  String line;
+bool readHttpLine(WiFiClient &client, char *line, size_t lineLen, uint32_t timeoutMs) {
+  if (!line || lineLen == 0) return false;
+  size_t pos = 0;
   uint32_t start = millis();
-  timedOut = false;
 
   while (millis() - start < timeoutMs) {
     while (client.available()) {
       char c = (char)client.read();
-      if (c == '\r') {
-        continue;
-      }
+      if (c == '\r') continue;
       if (c == '\n') {
-        return line;
+        line[pos] = '\0';
+        return true;
       }
-      line += c;
-      if (line.length() > 1024) {
-        return line;
+      if (pos + 1 < lineLen) {
+        line[pos++] = c;
       }
     }
+
     if (!client.connected()) {
-      return line;
+      line[pos] = '\0';
+      return pos > 0;
     }
     delay(1);
   }
 
-  timedOut = true;
-  return line;
+  line[pos] = '\0';
+  return false;
 }
 
-bool isOctetStream(String contentType) {
-  contentType.toLowerCase();
-  int semicolon = contentType.indexOf(';');
-  if (semicolon >= 0) {
-    contentType = contentType.substring(0, semicolon);
-  }
-  contentType.trim();
-  return contentType == "application/octet-stream";
+bool isOctetStream(const char *contentType) {
+  if (!contentType) return false;
+  while (*contentType == ' ' || *contentType == '\t') contentType++;
+
+  size_t len = 0;
+  while (contentType[len] && contentType[len] != ';') len++;
+  while (len > 0 && (contentType[len - 1] == ' ' || contentType[len - 1] == '\t')) len--;
+
+  return tokenEqualsIgnoreCase(contentType, len, "application/octet-stream");
 }
 
 void printVersion() {
+  char fw[FW_VERSION_MAX];
+  char mac[24];
+  getCurrentFirmwareVersion(fw, sizeof(fw));
+  getMacHyphen(mac, sizeof(mac));
+
   Serial.println();
   Serial.println("ESP32-C3 OTA Sketch");
   Serial.print("Firmware: ");
-  Serial.println(currentFirmwareVersion());
+  Serial.println(fw);
   Serial.print("Build file: ");
   Serial.println(baseName(OTA_SOURCE_FILE));
   Serial.print("MAC: ");
-  Serial.println(espMacHyphen());
+  Serial.println(mac);
   Serial.print("Free sketch space: ");
   Serial.print(ESP.getFreeSketchSpace() / 1024);
   Serial.println(" KB");
@@ -307,45 +347,81 @@ void printEta(uint32_t seconds) {
   }
 }
 
-void otaFail(WiFiClient *client, const String &msg, bool verbose) {
+void otaFail(WiFiClient *client, const char *msg, bool verbose) {
   if (verbose) {
     Serial.print("OTA Fehler: ");
-    Serial.println(msg);
+    Serial.println(msg ? msg : "Unbekannter Fehler.");
   }
   Update.abort();
-  if (client) {
-    client->stop();
+  if (client) client->stop();
+}
+
+void otaFailNum(WiFiClient *client, const char *msg, int value, bool verbose) {
+  if (verbose) {
+    Serial.print("OTA Fehler: ");
+    Serial.print(msg);
+    Serial.println(value);
   }
+  Update.abort();
+  if (client) client->stop();
+}
+
+bool eraseSpiffsPartition(bool verbose) {
+  const esp_partition_t *p = esp_partition_find_first(
+    ESP_PARTITION_TYPE_DATA,
+    ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+    nullptr
+  );
+
+  if (!p) {
+    if (verbose) Serial.println("SPIFFS Partition nicht gefunden.");
+    return false;
+  }
+
+  if (verbose) {
+    Serial.print("Loesche SPIFFS Partition: ");
+    Serial.print(p->label);
+    Serial.print(", Groesse: ");
+    Serial.print(p->size / 1024);
+    Serial.println(" KB");
+  }
+
+  esp_err_t err = esp_partition_erase_range(p, 0, p->size);
+  if (verbose) {
+    Serial.println(err == ESP_OK ? "SPIFFS Partition wurde geloescht." : "SPIFFS Partition konnte nicht geloescht werden.");
+  }
+  return err == ESP_OK;
 }
 
 // =========================
 // HTTP-only OTA Kernfunktion
 // =========================
-bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool verbose = true) {
-  url = normalizeHttpUrl(url);
+bool loadUpdate(const char *url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool verbose = true) {
+  if (!url || !*url) url = DEFAULT_UPDATE_URL;
 
-  if (url == "http://" || url.length() < 10) {
-    if (verbose) {
-      Serial.println("OTA Fehler: Keine Update URL angegeben.");
-    }
+  if (!url || !*url) {
+    if (verbose) Serial.println("OTA Fehler: Keine Update URL angegeben.");
     return false;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    if (verbose) Serial.println("OTA Fehler: WLAN ist nicht verbunden.");
+    return false;
+  }
+
+  ParsedHttpUrl parsed;
+  char error[120];
+  if (!parseHttpUrl(url, parsed, error, sizeof(error))) {
     if (verbose) {
-      Serial.println("OTA Fehler: WLAN ist nicht verbunden.");
+      Serial.print("OTA Fehler: ");
+      Serial.println(error);
     }
     return false;
   }
 
-  String fullUrl = addUpdateQueryParams(url);
-  String parseError;
-  ParsedHttpUrl parsed = parseHttpUrl(fullUrl, parseError);
-  if (!parsed.ok) {
-    if (verbose) {
-      Serial.print("OTA Fehler: ");
-      Serial.println(parseError);
-    }
+  char requestTarget[REQUEST_TARGET_MAX];
+  if (!buildRequestTarget(parsed, requestTarget, sizeof(requestTarget))) {
+    if (verbose) Serial.println("OTA Fehler: Request URL ist zu lang.");
     return false;
   }
 
@@ -353,81 +429,75 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   client.setTimeout(HTTP_TIMEOUT_MS);
 
   if (verbose) {
-    Serial.print("OTA URL: ");
-    Serial.println(fullUrl);
-    Serial.print("Verbinde mit ");
+    Serial.print("OTA Host: ");
     Serial.print(parsed.host);
     Serial.print(":");
     Serial.println(parsed.port);
+    Serial.print("OTA Pfad: ");
+    Serial.println(requestTarget);
   }
 
-  if (!client.connect(parsed.host.c_str(), parsed.port)) {
+  if (!client.connect(parsed.host, parsed.port)) {
     otaFail(&client, "TCP Verbindung fehlgeschlagen.", verbose);
     return false;
   }
 
-  client.print(String("GET ") + parsed.path + " HTTP/1.1\r\n");
-  client.print(String("Host: ") + parsed.host + "\r\n");
-  client.print("User-Agent: ESP32C3-OTA/1.0\r\n");
-  client.print("Accept: application/octet-stream\r\n");
-  client.print("Cache-Control: no-cache\r\n");
-  client.print("Connection: close\r\n");
-  client.print("\r\n");
+  client.print("GET ");
+  client.print(requestTarget);
+  client.print(" HTTP/1.1\r\nHost: ");
+  client.print(parsed.host);
+  client.print("\r\nUser-Agent: ESP32C3-OTA/1.0\r\nAccept: application/octet-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
 
-  bool timedOut = false;
-  String statusLine = readHttpLine(client, HTTP_TIMEOUT_MS, timedOut);
-  if (timedOut || statusLine.length() == 0) {
+  char line[384];
+  if (!readHttpLine(client, line, sizeof(line), HTTP_TIMEOUT_MS)) {
     otaFail(&client, "Keine HTTP Statuszeile erhalten.", verbose);
     return false;
   }
 
-  int firstSpace = statusLine.indexOf(' ');
-  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
   int httpCode = 0;
-  if (firstSpace >= 0) {
-    String codeText = secondSpace > firstSpace ? statusLine.substring(firstSpace + 1, secondSpace) : statusLine.substring(firstSpace + 1);
-    httpCode = codeText.toInt();
-  }
+  char *firstSpace = strchr(line, ' ');
+  if (firstSpace) httpCode = atoi(firstSpace + 1);
 
   if (httpCode != 200) {
-    otaFail(&client, "HTTP Status ist nicht 200. Statuszeile: " + statusLine, verbose);
+    if (verbose) {
+      Serial.print("HTTP Statuszeile: ");
+      Serial.println(line);
+    }
+    otaFailNum(&client, "HTTP Status ist nicht 200, sondern ", httpCode, verbose);
     return false;
   }
 
-  String contentType;
+  char contentType[96] = "";
   int contentLength = -1;
 
   while (true) {
-    String line = readHttpLine(client, HTTP_TIMEOUT_MS, timedOut);
-    if (timedOut) {
+    if (!readHttpLine(client, line, sizeof(line), HTTP_TIMEOUT_MS)) {
       otaFail(&client, "Timeout beim Lesen der HTTP Header.", verbose);
       return false;
     }
 
-    if (line.length() == 0) {
-      break;
-    }
+    if (line[0] == '\0') break;
 
-    int colon = line.indexOf(':');
-    if (colon <= 0) {
-      continue;
-    }
+    char *colon = strchr(line, ':');
+    if (!colon) continue;
+    *colon = '\0';
+    char *name = trimInPlace(line);
+    char *value = trimInPlace(colon + 1);
 
-    String name = line.substring(0, colon);
-    String value = line.substring(colon + 1);
-    name.trim();
-    value.trim();
-    name.toLowerCase();
-
-    if (name == "content-type") {
-      contentType = value;
-    } else if (name == "content-length") {
-      contentLength = value.toInt();
+    if (equalsIgnoreCase(name, "Content-Type")) {
+      copySafe(contentType, sizeof(contentType), value);
+    } else if (equalsIgnoreCase(name, "Content-Length")) {
+      contentLength = atoi(value);
     }
   }
 
   if (!isOctetStream(contentType)) {
-    otaFail(&client, "Content-Type ist nicht application/octet-stream, sondern '" + contentType + "'", verbose);
+    if (verbose) {
+      Serial.print("Content-Type erhalten: '");
+      Serial.print(contentType);
+      Serial.println("'");
+    }
+    otaFail(&client, "Content-Type ist nicht application/octet-stream.", verbose);
     return false;
   }
 
@@ -442,12 +512,14 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   size_t maxAllowed = nextPartitionSize > 0 ? nextPartitionSize : freeSketchSpace;
 
   if (maxAllowed > 0 && (size_t)contentLength > maxAllowed) {
-    String msg = "Firmware ist zu gross: ";
-    msg += String(contentLength / 1024);
-    msg += " KB, verfuegbarer OTA App Speicher: ";
-    msg += String(maxAllowed / 1024);
-    msg += " KB";
-    otaFail(&client, msg, verbose);
+    if (verbose) {
+      Serial.print("OTA Fehler: Firmware ist zu gross: ");
+      Serial.print((unsigned long)(contentLength / 1024));
+      Serial.print(" KB, verfuegbarer OTA App Speicher: ");
+      Serial.print((unsigned long)(maxAllowed / 1024));
+      Serial.println(" KB");
+    }
+    client.stop();
     return false;
   }
 
@@ -469,7 +541,11 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   }
 
   if (!Update.begin((size_t)contentLength, U_FLASH)) {
-    otaFail(&client, "Update.begin fehlgeschlagen: " + String(Update.errorString()), verbose);
+    if (verbose) {
+      Serial.print("OTA Fehler: Update.begin fehlgeschlagen: ");
+      Serial.println(Update.errorString());
+    }
+    client.stop();
     return false;
   }
 
@@ -480,9 +556,7 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   uint32_t lastReportMs = startMs;
   uint32_t lastDataMs = startMs;
 
-  if (verbose) {
-    Serial.println("Download startet...");
-  }
+  if (verbose) Serial.println("Download startet...");
 
   while (written < (size_t)contentLength) {
     int available = client.available();
@@ -501,13 +575,9 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
     }
 
     size_t remaining = (size_t)contentLength - written;
-    size_t toRead = available;
-    if (toRead > OTA_BUFFER_SIZE) {
-      toRead = OTA_BUFFER_SIZE;
-    }
-    if (toRead > remaining) {
-      toRead = remaining;
-    }
+    size_t toRead = (size_t)available;
+    if (toRead > OTA_BUFFER_SIZE) toRead = OTA_BUFFER_SIZE;
+    if (toRead > remaining) toRead = remaining;
 
     int readBytes = client.readBytes(buffer, toRead);
     if (readBytes <= 0) {
@@ -519,7 +589,12 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
 
     size_t updateWritten = Update.write(buffer, (size_t)readBytes);
     if (updateWritten != (size_t)readBytes) {
-      otaFail(&client, "Update.write fehlgeschlagen: " + String(Update.errorString()), verbose);
+      if (verbose) {
+        Serial.print("OTA Fehler: Update.write fehlgeschlagen: ");
+        Serial.println(Update.errorString());
+      }
+      Update.abort();
+      client.stop();
       return false;
     }
 
@@ -527,25 +602,31 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
 
     uint32_t now = millis();
     if (verbose && (now - lastReportMs >= 1000 || written == (size_t)contentLength)) {
-      float elapsedSec = (now - startMs) / 1000.0f;
-      float intervalSec = (now - lastReportMs) / 1000.0f;
-      if (elapsedSec <= 0.0f) elapsedSec = 0.001f;
-      if (intervalSec <= 0.0f) intervalSec = 0.001f;
+      uint32_t elapsedMs = now - startMs;
+      uint32_t intervalMs = now - lastReportMs;
+      if (elapsedMs == 0) elapsedMs = 1;
+      if (intervalMs == 0) intervalMs = 1;
 
-      float avgKBs = (written / 1024.0f) / elapsedSec;
-      float nowKBs = ((written - lastWritten) / 1024.0f) / intervalSec;
+      uint32_t percent = (uint32_t)(((uint64_t)written * 100ULL) / (uint64_t)contentLength);
+      uint32_t nowKBs = (uint32_t)((((uint64_t)(written - lastWritten)) * 1000ULL) / intervalMs / 1024ULL);
+      uint32_t avgKBs = (uint32_t)((((uint64_t)written) * 1000ULL) / elapsedMs / 1024ULL);
+      uint32_t avgBps = (uint32_t)((((uint64_t)written) * 1000ULL) / elapsedMs);
       uint32_t etaSec = 0;
-      if (avgKBs > 0.01f) {
-        etaSec = (uint32_t)(((contentLength - written) / 1024.0f) / avgKBs);
+      if (avgBps > 0) {
+        etaSec = (uint32_t)((((uint64_t)contentLength - written) + avgBps - 1) / avgBps);
       }
 
-      float percent = (100.0f * written) / contentLength;
-      Serial.printf("OTA %.1f%%, %lu/%lu KB, %.1f KB/s aktuell, %.1f KB/s Schnitt, ETA ",
-                    percent,
-                    (unsigned long)(written / 1024),
-                    (unsigned long)(contentLength / 1024),
-                    nowKBs,
-                    avgKBs);
+      Serial.print("OTA ");
+      Serial.print(percent);
+      Serial.print("%, ");
+      Serial.print((unsigned long)(written / 1024));
+      Serial.print("/");
+      Serial.print((unsigned long)(contentLength / 1024));
+      Serial.print(" KB, ");
+      Serial.print(nowKBs);
+      Serial.print(" KB/s aktuell, ");
+      Serial.print(avgKBs);
+      Serial.print(" KB/s Schnitt, ETA ");
       printEta(etaSec);
       Serial.println();
 
@@ -557,12 +638,17 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   }
 
   if (written != (size_t)contentLength) {
-    otaFail(&client, "Download unvollstaendig: " + String(written) + " von " + String(contentLength) + " Bytes.", verbose);
+    otaFail(&client, "Download unvollstaendig.", verbose);
     return false;
   }
 
   if (!Update.end(true)) {
-    otaFail(&client, "Update.end fehlgeschlagen: " + String(Update.errorString()), verbose);
+    if (verbose) {
+      Serial.print("OTA Fehler: Update.end fehlgeschlagen: ");
+      Serial.println(Update.errorString());
+    }
+    Update.abort();
+    client.stop();
     return false;
   }
 
@@ -574,18 +660,7 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
   client.stop();
 
   if (deleteFlash) {
-    if (verbose) {
-      Serial.println("Formatiere SPIFFS...");
-    }
-    if (SPIFFS.begin(true)) {
-      bool ok = SPIFFS.format();
-      SPIFFS.end();
-      if (verbose) {
-        Serial.println(ok ? "SPIFFS wurde geloescht." : "SPIFFS format fehlgeschlagen.");
-      }
-    } else if (verbose) {
-      Serial.println("SPIFFS.begin fehlgeschlagen, SPIFFS wurde nicht geloescht.");
-    }
+    eraseSpiffsPartition(verbose);
   }
 
   if (verbose) {
@@ -601,16 +676,15 @@ bool loadUpdate(String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool 
 // =========================
 // Polling API
 // =========================
-void start_polling(uint32_t seconds, String url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool verbose = true) {
+void start_polling(uint32_t seconds, const char *url = DEFAULT_UPDATE_URL, bool deleteFlash = false, bool verbose = true) {
   if (seconds == 0) {
     otaPollingEnabled = false;
-    if (verbose) {
-      Serial.println("Polling deaktiviert, weil Intervall 0 ist.");
-    }
+    if (verbose) Serial.println("Polling deaktiviert, weil Intervall 0 ist.");
     return;
   }
 
-  otaPollUrl = normalizeHttpUrl(url);
+  if (!url || !*url) url = DEFAULT_UPDATE_URL;
+  copySafe(otaPollUrl, sizeof(otaPollUrl), url);
   otaPollIntervalSeconds = seconds;
   otaPollDeleteFlash = deleteFlash;
   otaPollVerbose = verbose;
@@ -627,15 +701,11 @@ void start_polling(uint32_t seconds, String url = DEFAULT_UPDATE_URL, bool delet
 
 void stop_polling(bool verbose = true) {
   otaPollingEnabled = false;
-  if (verbose) {
-    Serial.println("Polling deaktiviert.");
-  }
+  if (verbose) Serial.println("Polling deaktiviert.");
 }
 
 void handleOtaPolling() {
-  if (!otaPollingEnabled || otaPollIntervalSeconds == 0) {
-    return;
-  }
+  if (!otaPollingEnabled || otaPollIntervalSeconds == 0) return;
 
   uint32_t now = millis();
   uint32_t intervalMs = otaPollIntervalSeconds * 1000UL;
@@ -648,36 +718,8 @@ void handleOtaPolling() {
 // =========================
 // Serial Helper
 // =========================
-String serialLine;
-
-String argAt(const String &line, int index) {
-  int current = 0;
-  int start = -1;
-
-  for (int i = 0; i <= (int)line.length(); i++) {
-    bool isSep = i == (int)line.length() || line[i] == ' ' || line[i] == '\t';
-    if (!isSep && start < 0) {
-      start = i;
-    }
-    if (isSep && start >= 0) {
-      if (current == index) {
-        return line.substring(start, i);
-      }
-      current++;
-      start = -1;
-    }
-  }
-  return "";
-}
-
-bool argBool(const String &value, bool fallback) {
-  if (value.length() == 0) return fallback;
-  String v = value;
-  v.toLowerCase();
-  if (v == "1" || v == "true" || v == "yes" || v == "ja" || v == "on") return true;
-  if (v == "0" || v == "false" || v == "no" || v == "nein" || v == "off") return false;
-  return fallback;
-}
+char serialLine[SERIAL_LINE_MAX];
+size_t serialLineLen = 0;
 
 void printSerialHelp() {
   Serial.println("Befehle:");
@@ -690,45 +732,65 @@ void printSerialHelp() {
   Serial.println();
 }
 
-void handleSerialCommand(String line) {
-  line.trim();
-  if (line.length() == 0) return;
+bool argBool(const char *value, bool fallback) {
+  if (!value || !*value) return fallback;
+  if (equalsIgnoreCase(value, "1") || equalsIgnoreCase(value, "true") || equalsIgnoreCase(value, "yes") || equalsIgnoreCase(value, "ja") || equalsIgnoreCase(value, "on")) return true;
+  if (equalsIgnoreCase(value, "0") || equalsIgnoreCase(value, "false") || equalsIgnoreCase(value, "no") || equalsIgnoreCase(value, "nein") || equalsIgnoreCase(value, "off")) return false;
+  return fallback;
+}
 
-  String cmd = argAt(line, 0);
-  cmd.trim();
-  cmd.toLowerCase();
+int splitArgs(char *line, char **argv, int maxArgs) {
+  int argc = 0;
+  char *p = line;
 
-  if (cmd == "help" || cmd == "?") {
+  while (*p && argc < maxArgs) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) break;
+    argv[argc++] = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) {
+      *p = '\0';
+      p++;
+    }
+  }
+  return argc;
+}
+
+void handleSerialCommand(char *line) {
+  char *argv[6];
+  int argc = splitArgs(line, argv, 6);
+  if (argc <= 0) return;
+
+  const char *cmd = argv[0];
+
+  if (equalsIgnoreCase(cmd, "help") || equalsIgnoreCase(cmd, "?")) {
     printSerialHelp();
     return;
   }
 
-  if (cmd == "version") {
+  if (equalsIgnoreCase(cmd, "version")) {
     printVersion();
     return;
   }
 
-  if (cmd == "update" || cmd == "loadupdate") {
-    String url = argAt(line, 1);
-    bool deleteFlash = argBool(argAt(line, 2), false);
-    bool verbose = argBool(argAt(line, 3), true);
+  if (equalsIgnoreCase(cmd, "update") || equalsIgnoreCase(cmd, "loadUpdate")) {
+    const char *url = argc > 1 ? argv[1] : DEFAULT_UPDATE_URL;
+    bool deleteFlash = argc > 2 ? argBool(argv[2], false) : false;
+    bool verbose = argc > 3 ? argBool(argv[3], true) : true;
     loadUpdate(url, deleteFlash, verbose);
     return;
   }
 
-  if (cmd == "start_polling") {
-    uint32_t seconds = (uint32_t)argAt(line, 1).toInt();
-    String url = argAt(line, 2);
-    if (url.length() == 0) {
-      url = DEFAULT_UPDATE_URL;
-    }
-    bool deleteFlash = argBool(argAt(line, 3), false);
-    bool verbose = argBool(argAt(line, 4), true);
+  if (equalsIgnoreCase(cmd, "start_polling")) {
+    uint32_t seconds = argc > 1 ? (uint32_t)strtoul(argv[1], nullptr, 10) : 0;
+    const char *url = argc > 2 ? argv[2] : DEFAULT_UPDATE_URL;
+    bool deleteFlash = argc > 3 ? argBool(argv[3], false) : false;
+    bool verbose = argc > 4 ? argBool(argv[4], true) : true;
     start_polling(seconds, url, deleteFlash, verbose);
     return;
   }
 
-  if (cmd == "stop_polling") {
+  if (equalsIgnoreCase(cmd, "stop_polling")) {
     stop_polling(true);
     return;
   }
@@ -745,14 +807,14 @@ void otaSerialHelper() {
     if (c == '\r') continue;
 
     if (c == '\n') {
+      serialLine[serialLineLen] = '\0';
       handleSerialCommand(serialLine);
-      serialLine = "";
+      serialLineLen = 0;
+    } else if (serialLineLen + 1 < sizeof(serialLine)) {
+      serialLine[serialLineLen++] = c;
     } else {
-      serialLine += c;
-      if (serialLine.length() > 512) {
-        serialLine = "";
-        Serial.println("Serial Eingabe zu lang, verworfen.");
-      }
+      serialLineLen = 0;
+      Serial.println("Serial Eingabe zu lang, verworfen.");
     }
   }
 }

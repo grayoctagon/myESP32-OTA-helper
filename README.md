@@ -76,6 +76,17 @@ Für OTA werden zwei App Partitionen benötigt. Empfohlen ist eine Partitionieru
 
 Benutzerdefinierte Partitionierungen kann man hier gut erstellen: [https://esp32.jgarrettcorbin.com/](https://esp32.jgarrettcorbin.com/)
 
+## init Prompt 
+
+ich habe einen ESP32C3 super mini, ich würde gerne einen arduino sketch schreiben, der sich selbst ota updaten kann, dazu soll er einerseits im setup immer die eigene version ausgeben, er soll auch eine funktion loadUpdate haben, die als parameter eine https oder http url annimmt (wenn nicht angegeben, soll http verwendet werden) und einen parameter "deleteFlash" (also dass der lokale SPIFFS flash gelöscht werden soll nachdem das update geladen wurde), und einen parameter "verbose"(also ob via serial informationen ausgegeben werden sollen, oder nicht). Beim Aufruf der url sollen die get-parameter ?macadress=<espMacAddress,e.g.12-34-56-78-90-12>&currentFirmware=<currentfirmware> angegeben werden.
+Beim Download soll im header geprüft werden ob es einen code 200 gibt und der content-type "application/octet-stream" ist, wenn nicht soll ein Fehler ausgegeben werden. Es soll auch anhand des headers prüfen ob genug platz im App-speicher im flash ist (ggf einen Fehler ausgeben).
+Die Funktion soll von der angegebenen url die neue firmware als bin-file direkt un den unbenutzten app-speicher laden, und den download Vortschritt ca einmal die sekunde ausgeben, inklusibe wieviele KB/s und wie viel zeit es noch dauert. Nachdem die Firmware heruntergeladen wurde soll diese aktiviert/geflasht werden und der esp soll damit neustarten. Meine aktuelle flash Partitionierung in der arduino ide ist: (zwei mal) 1.2MB APP + 1.5MB SPIFFS 
+verwende um die aktuelle vdersion zu benennen __DATE__  __TIME__ und __FILE_NAME__ (falls es das nicht gibt nimm __FILE__ um den teil nach dem letzten / bzw \ zu verwenden) mache es url save, damit es ca so aussieht: "May-24-2026_14-37-12_ESP32C3_OTA.ino" .
+
+Es soll außerdem eine helper funktion geben die serial eingaben abwartet und mit der ich via Serail ein update laden kann
+als auch eine "start_polling" funktion die als parameter die sekunden übernimmt in denen gepollt werden soll, z.B. "start_polling 300" = alle 5 minuten
+
+
 
 ## License: 
 Attribution-ShareAlike 4.0 International CC-BY-SA 
