@@ -1,0 +1,126 @@
+Ich habe einen Arduino Sketch für einen ESP32-C3. Bitte schreibe mir dazu ein passendes PHP Backend inklusive Web-Frontend.
+
+Ziel:
+Erstelle eine einzige PHP-Datei namens index.php. Diese Datei soll Backend, API und Frontend enthalten. Es soll minimales CSS und minimales JavaScript enthalten sein. Alle Frontend-Aktionen sollen per AJAX abgesendet werden.
+
+Technische Vorgaben:
+- Eine einzige PHP-Datei: index.php
+- Keine Datenbank
+- Persistenz ausschließlich über data.json
+- Firmware-Dateien liegen im Ordner bins
+- PHP 8 kompatibel
+- Keine externen Libraries
+- JSON-Zugriffe müssen mit flock() abgesichert werden
+- data.json soll automatisch angelegt werden, falls sie fehlt
+- Schreibvorgänge auf data.json sollen möglichst atomar erfolgen
+- Fehler sollen als JSON mit success:false zurückgegeben werden
+- Frontend soll HTML, minimales CSS und minimales JS direkt in index.php enthalten
+
+Datenmodell:
+Bitte verwende dieses Datenmodell für data.json , falls Felder fehlen, sollen sinnvolle Defaults ergänzt werden.
+
+```
+{
+  "logLimit":300,
+  "maxKnownESP":4,
+  "esps":{
+    "08-92-72-12-34-56":{
+      "label":"Giesroboter",
+      "lastSeenT":"1780239457849",
+      "lastSeenISO8601":"2026-05-31T16:57:37.849+02:00",
+      "lastFirmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
+      "lastFirmwareDownloadT":1780239457849,
+      "lastFirmwareDownloadISO8601":"2026-05-31T16:57:37.849+02:00",
+      "nextFirmwareFile":"*Esp32c3_Ota_test.ino.bin",
+      "recentVisits":[
+        {
+          "t":"1780122231232",
+          "tISO8601":"2026-05-30T08:23:51.232+02:00",
+          "firmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
+          "didDownload":false, 
+          "IP":"178.190.164.208", 
+          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
+        },
+        {
+          "t":"1780239457849",
+          "tISO8601":"2026-05-31T16:57:37.849+02:00",
+          "firmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
+          "didDownload":"Esp32c3_Ota_test.ino.bin", 
+          "IP":"178.190.164.208", 
+          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
+        }
+      ]
+    }
+  },
+  "allowedTokens":[
+    {
+      "label":"python Uploadscript",
+      "hash":"$2y$12$4Umg0rCJwMswRw/l.SwHvuQV01coP0eWmGzd61QH2RvAOMANUBGC.",
+      "allowedUpload":true,
+      "recentVisits":[
+        {
+          "t":"1780122231232",
+          "tISO8601":"2026-05-30T08:23:51.232+02:00",
+          "action":"uploadbin",
+          "action_note":"uploaded Esp32c3_Ota_test.ino.bin",
+        }
+      ]
+    },
+    {
+      "label":"frontend Viewer",
+      "hash":"$2y$12$4KpGhF3nVdu6f9oDMfGJq.p7G2b8IiQIVG7ymBaDuqfkPdCy9kq2e",
+      "allowedUpload":false,
+      "recentVisits":[
+        {
+          "t":"1780122231232",
+          "tISO8601":"2026-05-30T08:23:51.232+02:00",
+          "action":"view",
+        }
+      ]
+    },
+    {
+      "label":"frontend Admin",
+      "hash":"$2y$12$V/nIWQAtTdMNhst3Zgto2OTssQo7ZRY3SDFEtwT6PfY/gDJiAmGcK",
+      "allowedUpload":true,
+      "recentVisits":[
+        {
+          "t":"1780122231232",
+          "tISO8601":"2026-05-30T08:23:51.232+02:00",
+          "action":"changeTokenOther",
+          "action_note":"change Token of: frontend Viewer", 
+          "IP":"178.190.164.208", 
+          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
+        }
+      ]
+    }
+  ],
+  "files":[
+    {
+      "name":"Esp32c3_Ota_test.ino.bin",
+      "label":"a test firmware for ota",
+      "versions":["2026-05-31T16_57_37.849+02_00_Esp32c3_Ota_test.ino.bin"]
+    }
+  ]
+}
+```
+
+
+
+
+Die ESP authentifizieren sich via MAC Adresse(ja unsicher ich weis, dem risiko bin ich mir bewusst), haben aber generell nur "read only" rechte, können also nur die für sie bestimmte firmwares herunterladen, ihre besuche werden aber in der data.json geloggt, aber mit einem limit, per default ein limit von 300 "visit" logeinträgen. 
+Wenn sich ein unbekannter ESP meldet, wird er als neuer eintrag mit aufgenommen, mit dem label "new ESP at <iso time>", das "nextFirmwareFile" ist per default false. 
+das "maxKnownESP" Limit ist um das zuspammen zu reduzieren, da es ja keine ordentliche authentifizierung gibt, damit nicht jemand einfach eine billion esps anlegt. Das resultat für einen neuen/unbekannten ESP wenn das limit erreicht ist und für einen mit "nextFirmwareFile" soll gleich sein, also "no new firmware available", um Angreifenden keine information zu geben ob das anlegen erfolgreich war.
+
+Die neue firmware wird nur zum download angeboten, wenn deren upload jünder ist, als der "lastFirmwareDownloadT" Eintrag für den esp32 in der 
+Ich möchte auch im frontend eine option haben um neue firmwares hoch zu laden, die selbe schnittstelle (http post) soll später auch via python verwendbar sein. 
+Im Frontend und für die uploadschnittstelle authentifiziert man sich via token, welcher via password_verify mit den hashes in der config verglicheen werden(ich weis, das ist nicht effizient, aber es weden nicht viele sein), token können "allowedUpload"=true sein um selbst bin files hoch zu laden, oder nur read olny.
+read only können nur ihren eigenen token neu setzen. Wenn ein token "allowedUpload"=true hat, kann er auch andere tokens überschreiben.
+die hochgeladenen bin files werden in einem ordner "bins" in nummerierten unterordnern organisiert (die ordner namen sollen nur alphanumerische zeichen und die folgenden zeichen haben - und _ und . und + ) die files selbst haben zusetzlich zu ihrem "eskapten" namen den ISO8601 Sting forne dran (nur statt dopelpunkt einen unterstrich) also z.B. "Esp32c3_Ota_test.ino.bin" wird abgelegt in "bins/Esp32c3_Ota_test.ino.bin/2026-05-31T16_57_37.849+02_00_Esp32c3_Ota_test.ino.bin", die uploads werden auch im Frontend inkl der verschiedenen Versionen angezeigt.
+
+admin user können im frontend via dropdown (je ESP auswählen), welche firmware sie bekommen sollen, bzw "false" um keine firmware für den download anzubieten, je file soll entweder "*name" auswählbar sein, oder eine bestimmte version, ändert ein admin das gewählte file, soll auch der "lastFirmwareDownloadT" Eintrag auf false gesetzt werden, damit diese jedenfalls bei der nächsten anfrage heruntergeladen wird. 
+
+Überall wo es ein label gibt, soll dieses in klammern neden dem eindeutigen identifikator angezeigt werden, die admin-token sollen das laben im frontend aktualisieren können
+
+im frontend soll es eine möglicheit für einen "auto reload" geben, alle X sekunden (per default unchecked und 300, die einstellung soll im local storage hinterlegt werden und ausgelesen werden, damit es auch nach dem neuladen wieder greift, aber nur je browser session, nicht je token)
+
+recentVisits sollen via grünem rahmen hinterlegt sein, wenn sie jünger als 5 minuten sind, wenn sie jünger als 1 tag sind, dann blau, alles dazwischen in einem farbverlauf
