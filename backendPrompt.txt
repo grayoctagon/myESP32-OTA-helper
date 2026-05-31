@@ -17,110 +17,212 @@ Technische Vorgaben:
 - Frontend soll HTML, minimales CSS und minimales JS direkt in index.php enthalten
 
 Datenmodell:
-Bitte verwende dieses Datenmodell für data.json , falls Felder fehlen, sollen sinnvolle Defaults ergänzt werden.
+Bitte verwende dieses Datenmodell. Falls Felder fehlen, sollen sinnvolle Defaults ergänzt werden.
 
-```
 {
-  "logLimit":300,
-  "maxKnownESP":4,
-  "esps":{
-    "08-92-72-12-34-56":{
-      "label":"Giesroboter",
-      "lastSeenT":"1780239457849",
-      "lastSeenISO8601":"2026-05-31T16:57:37.849+02:00",
-      "lastFirmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
-      "lastFirmwareDownloadT":1780239457849,
-      "lastFirmwareDownloadISO8601":"2026-05-31T16:57:37.849+02:00",
-      "nextFirmwareFile":"*Esp32c3_Ota_test.ino.bin",
-      "recentVisits":[
-        {
-          "t":"1780122231232",
-          "tISO8601":"2026-05-30T08:23:51.232+02:00",
-          "firmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
-          "didDownload":false, 
-          "IP":"178.190.164.208", 
-          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
-        },
-        {
-          "t":"1780239457849",
-          "tISO8601":"2026-05-31T16:57:37.849+02:00",
-          "firmware":"May-31-2026_01-40-20_Esp32c3_Ota_test3.ino",
-          "didDownload":"Esp32c3_Ota_test.ino.bin", 
-          "IP":"178.190.164.208", 
-          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
-        }
-      ]
-    }
-  },
-  "allowedTokens":[
-    {
-      "label":"python Uploadscript",
-      "hash":"$2y$12$4Umg0rCJwMswRw/l.SwHvuQV01coP0eWmGzd61QH2RvAOMANUBGC.",
-      "allowedUpload":true,
-      "recentVisits":[
-        {
-          "t":"1780122231232",
-          "tISO8601":"2026-05-30T08:23:51.232+02:00",
-          "action":"uploadbin",
-          "action_note":"uploaded Esp32c3_Ota_test.ino.bin",
-        }
-      ]
-    },
-    {
-      "label":"frontend Viewer",
-      "hash":"$2y$12$4KpGhF3nVdu6f9oDMfGJq.p7G2b8IiQIVG7ymBaDuqfkPdCy9kq2e",
-      "allowedUpload":false,
-      "recentVisits":[
-        {
-          "t":"1780122231232",
-          "tISO8601":"2026-05-30T08:23:51.232+02:00",
-          "action":"view",
-        }
-      ]
-    },
-    {
-      "label":"frontend Admin",
-      "hash":"$2y$12$V/nIWQAtTdMNhst3Zgto2OTssQo7ZRY3SDFEtwT6PfY/gDJiAmGcK",
-      "allowedUpload":true,
-      "recentVisits":[
-        {
-          "t":"1780122231232",
-          "tISO8601":"2026-05-30T08:23:51.232+02:00",
-          "action":"changeTokenOther",
-          "action_note":"change Token of: frontend Viewer", 
-          "IP":"178.190.164.208", 
-          "gethostbyaddr":"178-190-164-208.adsl.highway.telekom.at"
-        }
-      ]
-    }
-  ],
-  "files":[
-    {
-      "name":"Esp32c3_Ota_test.ino.bin",
-      "label":"a test firmware for ota",
-      "versions":["2026-05-31T16_57_37.849+02_00_Esp32c3_Ota_test.ino.bin"]
-    }
-  ]
+  "logLimit": 300,
+  "maxKnownESP": 4,
+  "esps": {},
+  "allowedTokens": [],
+  "files": []
 }
-```
 
+Hinweis:
+Falls du wegen Kompatibilität lieber die Feldnamen aus meinem Beispiel verwendest, dann nutze trotzdem konsistent dieselben Namen im gesamten Code. Ich bevorzuge aber die korrigierten Namen:
+- allowedTokens statt allowedTockens
+- versions statt versios
 
+ESP-Authentifizierung:
+- ESPs authentifizieren sich nur über ihre MAC-Adresse.
+- Mir ist bewusst, dass das unsicher ist. Bitte keine zusätzliche ESP-Authentifizierung einbauen.
+- ESPs haben nur read-only Rechte.
+- ESPs dürfen nur die für sie ausgewählte Firmware herunterladen.
+- Jeder ESP-Besuch wird in data.json protokolliert.
+- recentVisits werden je ESP auf logLimit begrenzt.
+- Unbekannte ESPs werden automatisch aufgenommen, solange maxKnownESP nicht erreicht ist.
+- Das Label eines neuen ESP lautet: "new ESP at <iso time>"
+- nextFirmwareFile ist bei neuen ESPs standardmäßig false.
+- Wenn maxKnownESP erreicht ist, soll ein unbekannter ESP dieselbe Antwort bekommen wie ein bekannter ESP ohne verfügbare Firmware:
+  "no new firmware available"
+- Dadurch soll nicht erkennbar sein, ob ein neuer ESP angelegt wurde oder nicht.
 
+Firmware-Logik:
+- Eine neue Firmware wird nur angeboten, wenn sie jünger ist als lastFirmwareDownloadT des jeweiligen ESP.
+- Wenn nextFirmwareFile false ist, wird keine Firmware angeboten.
+- nextFirmwareFile kann entweder false, "*<filename>" oder eine konkrete Versionsdatei sein.
+- "*<filename>" bedeutet: neueste Version dieser Firmware-Datei verwenden.
+- Wenn ein Admin die Firmware-Zuweisung für einen ESP ändert, muss lastFirmwareDownloadT auf false gesetzt werden, damit die Firmware bei der nächsten Anfrage sicher angeboten wird.
 
-Die ESP authentifizieren sich via MAC Adresse(ja unsicher ich weis, dem risiko bin ich mir bewusst), haben aber generell nur "read only" rechte, können also nur die für sie bestimmte firmwares herunterladen, ihre besuche werden aber in der data.json geloggt, aber mit einem limit, per default ein limit von 300 "visit" logeinträgen. 
-Wenn sich ein unbekannter ESP meldet, wird er als neuer eintrag mit aufgenommen, mit dem label "new ESP at <iso time>", das "nextFirmwareFile" ist per default false. 
-das "maxKnownESP" Limit ist um das zuspammen zu reduzieren, da es ja keine ordentliche authentifizierung gibt, damit nicht jemand einfach eine billion esps anlegt. Das resultat für einen neuen/unbekannten ESP wenn das limit erreicht ist und für einen mit "nextFirmwareFile" soll gleich sein, also "no new firmware available", um Angreifenden keine information zu geben ob das anlegen erfolgreich war.
+Firmware-Dateien:
+- Uploads landen im Ordner bins.
+- Für jede Firmware gibt es einen Unterordner mit dem normalisierten Dateinamen.
+- Erlaubte Zeichen für Ordnernamen und Dateinamen: A-Z, a-z, 0-9, Punkt, Bindestrich, Unterstrich und Plus.
+- Der gespeicherte Dateiname bekommt vorne einen ISO-Zeitstempel, wobei Doppelpunkte durch Unterstriche ersetzt werden.
+- Beispiel:
+  Uploadname:
+  Esp32c3_Ota_test.ino.bin
 
-Die neue firmware wird nur zum download angeboten, wenn deren upload jünder ist, als der "lastFirmwareDownloadT" Eintrag für den esp32 in der 
-Ich möchte auch im frontend eine option haben um neue firmwares hoch zu laden, die selbe schnittstelle (http post) soll später auch via python verwendbar sein. 
-Im Frontend und für die uploadschnittstelle authentifiziert man sich via token, welcher via password_verify mit den hashes in der config verglicheen werden(ich weis, das ist nicht effizient, aber es weden nicht viele sein), token können "allowedUpload"=true sein um selbst bin files hoch zu laden, oder nur read olny.
-read only können nur ihren eigenen token neu setzen. Wenn ein token "allowedUpload"=true hat, kann er auch andere tokens überschreiben.
-die hochgeladenen bin files werden in einem ordner "bins" in nummerierten unterordnern organisiert (die ordner namen sollen nur alphanumerische zeichen und die folgenden zeichen haben - und _ und . und + ) die files selbst haben zusetzlich zu ihrem "eskapten" namen den ISO8601 Sting forne dran (nur statt dopelpunkt einen unterstrich) also z.B. "Esp32c3_Ota_test.ino.bin" wird abgelegt in "bins/Esp32c3_Ota_test.ino.bin/2026-05-31T16_57_37.849+02_00_Esp32c3_Ota_test.ino.bin", die uploads werden auch im Frontend inkl der verschiedenen Versionen angezeigt.
+  Speicherpfad:
+  bins/Esp32c3_Ota_test.ino.bin/2026-05-31T16_57_37.849+02_00_Esp32c3_Ota_test.ino.bin
 
-admin user können im frontend via dropdown (je ESP auswählen), welche firmware sie bekommen sollen, bzw "false" um keine firmware für den download anzubieten, je file soll entweder "*name" auswählbar sein, oder eine bestimmte version, ändert ein admin das gewählte file, soll auch der "lastFirmwareDownloadT" Eintrag auf false gesetzt werden, damit diese jedenfalls bei der nächsten anfrage heruntergeladen wird. 
+- Uploads sollen in data.json unter files gespeichert werden.
+- Im Frontend sollen alle Firmware-Dateien inklusive Versionen angezeigt werden.
 
-Überall wo es ein label gibt, soll dieses in klammern neden dem eindeutigen identifikator angezeigt werden, die admin-token sollen das laben im frontend aktualisieren können
+Token-System:
+- Frontend und Uploadschnittstelle authentifizieren sich per Token.
+- Tokens werden nicht im Klartext gespeichert.
+- In data.json stehen nur password_hash() Hashes.
+- Prüfung erfolgt mit password_verify().
+- allowedUpload:false bedeutet read-only.
+- allowedUpload:true bedeutet Admin- bzw. Upload-Rechte.
+- Read-only Tokens dürfen nur ihren eigenen Token neu setzen.
+- Tokens mit allowedUpload:true dürfen:
+  - Firmware hochladen
+  - ESP Labels ändern
+  - Token Labels ändern
+  - andere Tokens überschreiben
+  - Firmware-Zuweisungen pro ESP ändern
 
-im frontend soll es eine möglicheit für einen "auto reload" geben, alle X sekunden (per default unchecked und 300, die einstellung soll im local storage hinterlegt werden und ausgelesen werden, damit es auch nach dem neuladen wieder greift, aber nur je browser session, nicht je token)
+API-Actions:
+Implementiere mindestens diese Actions über index.php?action=...
 
-recentVisits sollen via grünem rahmen hinterlegt sein, wenn sie jünger als 5 minuten sind, wenn sie jünger als 1 tag sind, dann blau, alles dazwischen in einem farbverlauf
+1. action=esp_check
+   Methode: GET
+   Parameter:
+   - mac
+   - firmware optional
+
+   Verhalten:
+   - ESP-Besuch loggen
+   - lastSeenT und lastSeenISO8601 aktualisieren
+   - lastFirmware aktualisieren, falls Parameter firmware vorhanden
+   - prüfen, ob Firmware verfügbar ist
+   - falls keine Firmware verfügbar ist:
+     antworte exakt als Text:
+     no new firmware available
+   - falls Firmware verfügbar ist:
+     gib eine JSON-Antwort mit Download-URL zurück
+
+2. action=esp_download
+   Methode: GET
+   Parameter:
+   - mac
+
+   Verhalten:
+   - prüft, ob für diesen ESP eine Firmware verfügbar ist
+   - liefert die passende .bin Datei als Download aus
+   - setzt lastFirmwareDownloadT und lastFirmwareDownloadISO8601
+   - loggt didDownload
+
+3. action=frontend_data
+   Methode: POST
+   Authentifizierung: token
+   Verhalten:
+   - gibt alle für das Frontend benötigten Daten als JSON zurück
+   - read-only Tokens dürfen Daten sehen, aber keine Admin-Aktionen ausführen
+
+4. action=upload_bin
+   Methode: POST
+   Authentifizierung: token mit allowedUpload:true
+   Parameter:
+   - file
+   - label optional
+   Verhalten:
+   - validiert .bin Upload
+   - speichert Datei im bins Ordner
+   - aktualisiert files in data.json
+   - loggt Token recentVisits
+
+5. action=set_esp_firmware
+   Methode: POST
+   Authentifizierung: token mit allowedUpload:true
+   Parameter:
+   - mac
+   - nextFirmwareFile
+   Verhalten:
+   - setzt nextFirmwareFile
+   - setzt lastFirmwareDownloadT auf false
+   - setzt lastFirmwareDownloadISO8601 auf false oder entfernt es konsistent
+
+6. action=set_label
+   Methode: POST
+   Authentifizierung: token mit allowedUpload:true
+   Parameter:
+   - type: esp, token oder file
+   - id
+   - label
+
+7. action=change_token
+   Methode: POST
+   Authentifizierung: token
+   Parameter:
+   - targetTokenLabel oder targetTokenIndex
+   - newToken
+   Verhalten:
+   - read-only darf nur eigenen Token ändern
+   - allowedUpload:true darf andere Tokens ändern
+   - neuer Token wird mit password_hash() gespeichert
+
+Frontend:
+- Das Frontend soll in derselben index.php enthalten sein.
+- Beim Laden fragt das Frontend per AJAX action=frontend_data ab.
+- Es gibt ein Token-Eingabefeld.
+- Es gibt eine Übersicht aller ESPs.
+- Bei jedem ESP anzeigen:
+  - MAC
+  - Label in Klammern neben der MAC
+  - lastSeen
+  - lastFirmware
+  - lastFirmwareDownload
+  - nextFirmwareFile
+  - recentVisits
+- Admin-Token können ESP-Labels bearbeiten.
+- Admin-Token können pro ESP per Dropdown auswählen:
+  - false
+  - "*<firmware name>"
+  - konkrete Versionen
+- Es gibt eine Upload-Maske für .bin Dateien, sichtbar bzw. nutzbar nur mit allowedUpload:true.
+- Es gibt eine Übersicht aller Firmware-Dateien und Versionen.
+- Es gibt eine Übersicht der Tokens:
+  - eindeutige ID oder Index
+  - Label
+  - allowedUpload
+  - recentVisits
+- Wo immer ein Label existiert, soll es in Klammern neben dem eindeutigen Identifikator angezeigt werden.
+- Admin-Token können Labels im Frontend aktualisieren.
+- Read-only Tokens können nur ihren eigenen Token neu setzen.
+
+Auto Reload:
+- Im Frontend soll es eine Option für Auto Reload geben.
+- Checkbox standardmäßig unchecked.
+- Intervallfeld standardmäßig 300 Sekunden.
+- Einstellung soll in localStorage gespeichert werden.
+- Die Einstellung gilt je Browser, nicht je Token.
+- Wenn Auto Reload aktiv ist, wird regelmäßig per AJAX neu geladen.
+
+recentVisits Darstellung:
+- recentVisits sollen visuell markiert werden.
+- Jünger als 5 Minuten: grüner Rahmen.
+- Jünger als 1 Tag: blauer Rahmen.
+- Zwischen 5 Minuten und 1 Tag: Farbverlauf zwischen grün und blau.
+- Älter als 1 Tag: normale Darstellung.
+
+Sicherheit:
+- Keine Pfadmanipulation zulassen.
+- Dateinamen strikt normalisieren.
+- Nur .bin Uploads zulassen.
+- Uploadgröße sinnvoll begrenzen.
+- Niemals ungefilterte Nutzereingaben in HTML ausgeben.
+- HTML-Ausgabe immer mit htmlspecialchars escapen.
+- JSON Responses mit korrektem Content-Type senden.
+- Binärdownloads mit korrektem Content-Type senden.
+- Bei ungültiger Authentifizierung keine internen Details verraten.
+
+Ausgabe:
+Bitte gib zuerst den vollständigen Code für index.php aus.
+Danach gib eine kurze Installationsanleitung mit:
+- benötigte Ordnerrechte
+- Beispielstruktur
+- Hinweis, wie man erste Tokens in data.json anlegt
+- Beispiel-cURL für Firmware-Upload
+- Beispiel-cURL für ESP-Check
