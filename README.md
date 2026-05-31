@@ -53,9 +53,53 @@ start_polling 300 example.com/firmware/esp32c3.bin
 
 URLs ohne Schema werden automatisch als HTTP URL behandelt.
 
-## Server Anforderungen
+## Server-Backend
 
 Prompt für Serverseite: [backendPrompt.txt](./backendPrompt.txt)
+
+Das Server-Backend stellt eine einfache PHP-basierte OTA-Verwaltung für ESP32-C3 Geräte bereit. Es besteht aus einer einzigen Datei (`index.php`) und kombiniert Backend, API und Web-Frontend in einer kompakten Lösung ohne Datenbank. Die Persistenz erfolgt ausschließlich über `data.json`, Firmware-Dateien werden im Ordner `bins` abgelegt.
+
+![Server Backend V1](assetsForGit/server-backend-V1.png)
+
+### Installation
+
+1. [index.php](./server-backend/index.php) auf den Webserver hochladen.
+2. Eine passende [data.json](./server-backend/data.json) im selben Verzeichnis ablegen oder die Datei beim ersten Start automatisch erzeugen lassen.
+3. Sicherstellen, dass der Webserver Schreibrechte für folgende Dateien und Ordner hat:
+
+```text
+data.json
+bins/
+dataBackups/
+```
+
+4. Einen ersten Admin-Token erzeugen:
+
+```bash
+php -r 'echo password_hash("MEIN_ADMIN_TOKEN", PASSWORD_DEFAULT), PHP_EOL;'
+```
+
+5. Den erzeugten Hash in `data.json` unter `allowedTokens` eintragen:
+
+```json
+{
+  "label": "frontend Admin",
+  "hash": "HIER_DEN_GENERIERTEN_HASH_EINFUEGEN",
+  "allowedUpload": true,
+  "recentVisits": []
+}
+```
+
+6. Das Web-Frontend im Browser öffnen:
+
+```text
+https://example.org/pfad/zur/index.php?token=MEIN_ADMIN_TOKEN
+```
+
+Über das Frontend können anschließend ESP-Geräte verwaltet, Firmware-Dateien hochgeladen, OTA-Zuweisungen geändert, Tokens gepflegt und Backups der `data.json` erstellt werden.
+
+
+### Kommunikation mit dem Server
 
 Der Firmware Server muss direkt eine `.bin` Datei ausliefern und folgende Header setzen:
 
@@ -65,19 +109,18 @@ Content-Type: application/octet-stream
 Content-Length: <firmware-size>
 ```
 
-Beim Aufruf ergänzt der ESP32-C3 automatisch:
+Beim Aufruf ergänzt der ESP32-C3 an der URL automatisch:
 
 ```text
 ?macadress=<MAC>&currentFirmware=<VERSION>
 ```
-
-Der Gedanke hierbei ist Aufwärtskompatibilität, damit der Server später erkennen kann welcher ESP32 nach Software fragt und diese spezifisch zurück gibt. Damit es z.B. einen ESP gibt der immer die bewaesserung.ino.bin Software bekommt und ein anderer die Lampe.ino.bin
+(Tippfehler ist bekannt und in den ToDos)
 
 ---
 
 ## Sicherheitshinweis
 
-Diese Version verwendet bewusst nur HTTP, um den Sketch klein zu halten. Für produktive Anwendungen sollte die Firmware zusätzlich signiert oder anderweitig gegen Manipulation abgesichert werden.
+Diese Version verwendet für den ESP bewusst nur HTTP, um den Sketch klein zu halten. Für produktive Anwendungen sollte die Firmware zusätzlich signiert oder anderweitig gegen Manipulation abgesichert werden.
 
 ## Partitionierung
 
@@ -85,7 +128,7 @@ Für OTA werden zwei App Partitionen benötigt. Empfohlen ist eine Partitionieru
 
 Benutzerdefinierte Partitionierungen kann man hier gut erstellen: [https://esp32.jgarrettcorbin.com/](https://esp32.jgarrettcorbin.com/)
 
-## init Prompt 
+## init Prompt myESP32-OTA-helper
 
 ich habe einen ESP32C3 super mini, ich würde gerne einen arduino sketch schreiben, der sich selbst ota updaten kann, dazu soll er einerseits im setup immer die eigene version ausgeben, er soll auch eine funktion loadUpdate haben, die als parameter eine https oder http url annimmt (wenn nicht angegeben, soll http verwendet werden) und einen parameter "deleteFlash" (also dass der lokale SPIFFS flash gelöscht werden soll nachdem das update geladen wurde), und einen parameter "verbose"(also ob via serial informationen ausgegeben werden sollen, oder nicht). Beim Aufruf der url sollen die get-parameter ?macadress=<espMacAddress,e.g.12-34-56-78-90-12>&currentFirmware=<currentfirmware> angegeben werden.
 Beim Download soll im header geprüft werden ob es einen code 200 gibt und der content-type "application/octet-stream" ist, wenn nicht soll ein Fehler ausgegeben werden. Es soll auch anhand des headers prüfen ob genug platz im App-speicher im flash ist (ggf einen Fehler ausgeben).

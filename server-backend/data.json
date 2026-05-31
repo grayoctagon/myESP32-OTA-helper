@@ -1,0 +1,14 @@
+{
+  "logLimit": 300,
+  "maxKnownESP": 4,
+  "esps": {},
+  "allowedTokens": [
+    {
+      "label": "frontend Admin",
+      "hash": "$2y$10$HIER_DEN_GENERIERTEN_HASH_EINFUEGEN",
+      "allowedUpload": true,
+      "recentVisits": []
+    }
+  ],
+  "files": []
+}
