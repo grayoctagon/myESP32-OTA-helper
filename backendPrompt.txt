@@ -1,4 +1,4 @@
-Ich habe einen Arduino Sketch für einen ESP32-C3. Bitte schreibe mir dazu ein passendes PHP Backend inklusive Web-Frontend.
+Ich habe einen OTA (Over-the-Air update) Arduino Sketch für einen ESP32-C3. Bitte schreibe mir dazu ein passendes PHP Backend inklusive Web-Frontend.
 
 Ziel:
 Erstelle eine einzige PHP-Datei namens index.php. Diese Datei soll Backend, API und Frontend enthalten. Es soll minimales CSS und minimales JavaScript enthalten sein. Alle Frontend-Aktionen sollen per AJAX abgesendet werden.
